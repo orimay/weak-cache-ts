@@ -1,47 +1,49 @@
 {
   "name": "weak-cache-ts",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Garbage-collectable cache for TypeScript/JavaScript using WeakRefs: synchronous and asynchronous object caching with auto-cleanup, deduplication, flexible keys (string/symbol), safe insertion modes, and GC-friendly memory management for browsers/Node.js.",
-  "type": "module",
-  "license": "MIT",
+  "keywords": [
+    "async-cache",
+    "cache",
+    "deduplication",
+    "dispose",
+    "finalizationregistry",
+    "garbage-collection",
+    "gc-friendly",
+    "memoization",
+    "memory-management",
+    "object-cache",
+    "observable",
+    "promise",
+    "promise-deduplication",
+    "typescript",
+    "watcher",
+    "weak-cache",
+    "weakref"
+  ],
   "homepage": "https://github.com/orimay/weak-cache-ts#readme",
   "bugs": {
     "url": "https://github.com/orimay/weak-cache-ts/issues"
   },
+  "license": "MIT",
+  "author": "Dmitrii Baranov <dmitrii.a.baranov@gmail.com>",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/orimay/weak-cache-ts.git"
   },
-  "author": "Dmitrii Baranov <dmitrii.a.baranov@gmail.com>",
-  "keywords": [
-    "weakref",
-    "cache",
-    "weak-cache",
-    "gc-friendly",
-    "finalizationregistry",
-    "async-cache",
-    "memoization",
-    "resource-pool",
-    "memory-management",
-    "typescript",
-    "javascript",
-    "async-await",
-    "promise",
-    "object-cache",
-    "performance",
-    "browser",
-    "node-js",
-    "full-stack",
-    "utilities"
-  ],
   "files": [
     "dist"
   ],
+  "sideEffects": false,
+  "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./dist/index.js",
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
     "./package.json": "./package.json"
   },
   "scripts": {
@@ -49,7 +51,7 @@
     "dev": "tsdown --watch",
     "test": "bun --bun vitest",
     "typecheck": "tsc --noEmit",
-    "release": "bun run test run && bun run build && bumpp && bun publish"
+    "release": "bun run test -- run && bun run build && bumpp && bun publish"
   },
   "devDependencies": {
     "@types/bun": "^1.3.2",
