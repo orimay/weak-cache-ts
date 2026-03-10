@@ -14,11 +14,12 @@
  * - Multiple concurrent requests for the same key share one promise
  * - Supports both sync and async loaders, with sync fast-path optimization
  * - Manual eviction available via {@link WeakCacheAsync.del | del()} (also cancels pending loads)
+ * - Event-based cleanup notifications via {@link WeakCacheAsync.on | on('dispose')}}
  *
  * **Memory characteristics:** Like {@link WeakCache}, values are held weakly and automatically
  * cleaned up by garbage collection. Pending promises are also held weakly and cleaned up when resolved.
  *
- * @template Item - Type of cached objects (must be an object, not a primitive).
+ * @template Item - Type of cached objects (must be a WeakKey).
  * @template Id - Type of cache keys (string or symbol by default).
  *
  * @example
@@ -52,7 +53,7 @@
  * @see {@link WeakCache} for synchronous loading without network/async I/O.
  */
 export class WeakCacheAsync<
-  Item extends object,
+  Item extends WeakKey,
   Id extends string | symbol = string | symbol,
 > {
   /**
@@ -63,7 +64,8 @@ export class WeakCacheAsync<
    * resource explicitly invalidated, or request should be aborted).
    *
    * **Effect:** Pending promises for this key will still resolve, but the result won't be cached.
-   * The next {@link WeakCacheAsync.get | get()} will start a fresh load.
+   * The next {@link WeakCacheAsync.get | get()} will start a fresh load. The `'dispose'` event
+   * is NOT triggered for manual deletions.
    *
    * @param id - The key to remove from the cache.
    *
@@ -73,15 +75,21 @@ export class WeakCacheAsync<
    * ```
    */
   public readonly del = (id: Id) => {
+    const item = this.peek(id);
+    item !== undefined && this.#cacheRegistry.unregister(item);
     this.#cache.delete(id);
-    this.#cacheLoading.delete(id);
     this.#cacheWatchers.delete(id);
   };
 
   #loader: (id: Id) => Item | Promise<Item>;
   #cache = new Map<Id, WeakRef<Item>>();
   #cacheLoading = new Map<Id, WeakRef<Promise<Item>>>();
-  #cacheRegistry = new FinalizationRegistry<Id>(this.del);
+  #cacheRegistry = new FinalizationRegistry<Id>(id => {
+    this.#cache.delete(id);
+    this.#cacheWatchers.delete(id);
+    this.#trigger('dispose', id);
+  });
+
   #cacheWatchers = new Map<Id, Set<(item: Item) => void>>();
 
   /**
@@ -164,7 +172,7 @@ export class WeakCacheAsync<
    * }
    * ```
    */
-  public* entries(): Iterable<[Id, Item]> {
+  public *entries(): Iterable<[Id, Item]> {
     for (const [key, value] of this.#cache) {
       const item = value.deref();
       if (item !== undefined) {
@@ -198,7 +206,7 @@ export class WeakCacheAsync<
   }
 
   /**
-   * Retrieves a cached value or loads it asynchronously.
+   * Retrieves a cached value or loads it asynchronously. **Bound method** - safe for Array.map() and callbacks.
    *
    * Returns a promise that resolves to the same object instance for all concurrent and subsequent
    * calls with the same key (perfect deduplication). If a load is already in progress, the existing
@@ -212,8 +220,8 @@ export class WeakCacheAsync<
    * - `create`: Optional one-time factory override (sync or async) for this call only
    * - `init`: Optional post-load initializer (sync or async) for setup after loading
    *
-   * **Behavior:** If the loader returns synchronously, the promise resolves immediately in a microtask.
-   * If the loader is async, the promise resolves when loading completes.
+   * **Behavior:** If the loader returns synchronously, the promise resolves in the next microtask.
+   * If async, it resolves when loading completes. Calls watchers if this is the first time loading.
    *
    * @param id - Cache key to retrieve or load.
    * @param create - Optional override factory for this specific call (sync or async).
@@ -228,7 +236,7 @@ export class WeakCacheAsync<
    *
    * @example
    * ```typescript
-   * // Concurrent requests share the same promise
+   * // Concurrent requests share the same promise and object
    * const [a1, a2] = await Promise.all([
    *   avatarCache.get('dave'),
    *   avatarCache.get('dave')
@@ -248,6 +256,13 @@ export class WeakCacheAsync<
    *   }
    * );
    * ```
+   *
+   * @example
+   * ```typescript
+   * // Array.map() usage - bound method works perfectly
+   * const ids = ['user-1', 'user-2', 'user-3'];
+   * const users = await Promise.all(ids.map(userCache.get));
+   * ```
    */
   public readonly get = async (
     id: Id,
@@ -255,7 +270,7 @@ export class WeakCacheAsync<
     init?: (item: Item) => Promise<void> | void,
   ): Promise<Item> => {
     // 1. Fast path – already cached and alive
-    const cached = this.#cache.get(id)?.deref();
+    const cached = this.peek(id);
     if (cached !== undefined) return cached;
 
     // 2. Return existing pending promise if any
@@ -275,7 +290,7 @@ export class WeakCacheAsync<
       await init?.(item);
 
       // making sure to return the item either loaded now or set in parallel
-      return this.#trySet(id, item) ? item : this.get(id);
+      return this.set(id, item, 'try') ? item : this.get(id);
     }
 
     const item = loadPromise;
@@ -285,7 +300,7 @@ export class WeakCacheAsync<
       const wrapper = initPromise
         .then(() => {
           // making sure to return the item either loaded now or set in parallel
-          return this.#trySet(id, item) ? item : this.get(id);
+          return this.set(id, item, 'try') ? item : this.get(id);
         })
         .finally(() => this.#cacheLoading.delete(id));
       this.#cacheLoading.set(id, new WeakRef(wrapper));
@@ -293,11 +308,11 @@ export class WeakCacheAsync<
     }
 
     // making sure to return the item either loaded now or set in parallel
-    return this.#trySet(id, item) ? Promise.resolve(item) : this.get(id);
+    return this.set(id, item, 'try') ? Promise.resolve(item) : this.get(id);
   };
 
   /**
-   * Inspects the cache without triggering a load.
+   * Inspects the cache without triggering a load. **Bound method** - safe for callbacks.
    *
    * Returns the cached value if it exists, is fully loaded, and is still alive. Returns `undefined`
    * if the key is missing, load is pending, or value was garbage collected. Never starts a load.
@@ -325,127 +340,74 @@ export class WeakCacheAsync<
   };
 
   /**
-   * Legacy alias for {@link WeakCacheAsync.peek | peek()}.
-   *
-   * @deprecated Use {@link WeakCacheAsync.peek | peek()} instead. This method returns `null`
-   *   instead of `undefined` for missing values, which is less idiomatic.
-   *
-   * @param id - Key to inspect.
-   * @returns The live value or `null` if not present/loaded/collected.
-   */
-  public readonly tryGet = (id: Id): Item | null => {
-    return this.peek(id) ?? null;
-  };
-
-  /**
-   * Inserts a pre-created value into the cache if the slot is completely free.
-   *
-   * Succeeds only if the key has no live cached value **and** no pending load. Does nothing if
-   * the key already has a value or a load is in progress. This prevents interrupting in-flight
-   * operations and ensures that concurrent async operations complete naturally.
-   *
-   * **Pattern:** Preload or speculatively create objects, then try to cache them. If someone else
-   * is already loading or has cached it, your object is simply not stored.
-   *
-   * **Race safety:** If a load is pending, this returns `false` to avoid interrupting it, even
-   * if the load hasn't completed yet. This is different from {@link WeakCache.trySet | WeakCache.trySet},
-   * which only checks for existing values (since WeakCache has no async loading state).
-   *
-   * **Caveat:** To force-replace a value regardless of pending loads, use {@link WeakCacheAsync.forceSet | forceSet()} instead.
+   * Inserts, replaces, or conditionally sets a cached value.
    *
    * @param id - Cache key.
-   * @param item - Pre-created object to cache.
-   * @returns `true` if inserted, `false` if key has a value or pending load.
+   * @param item - Object to cache.
+   * @param mode - Insertion mode:
+   *   - `'force'` (default): Always insert, overwriting any existing value or pending load
+   *   - `'replace'`: Only insert if key already has a cached value, returns `false` otherwise (ignores pending loads)
+   *   - `'try'`: Only insert if key is completely empty (no cached value and no pending load), returns `false` otherwise
+   * @returns `true` if insertion succeeded, `false` if blocked by mode constraints.
+   *
+   * **Behavior:** Registers item for garbage collection tracking. Cancels any pending load. Fires watchers if value changes.
+   *
+   * **Mode details:**
+   * - `'force'`: Unconditionally replaces everything. Pending async loads are cancelled.
+   * - `'replace'`: Safe replace for already-cached items. Fails if nothing is cached yet. Pending loads don't block this.
+   * - `'try'`: Safe speculative insert. Fails if anything occupies the slot (cached value or pending load).
    *
    * @example
    * ```typescript
-   * // Speculative preloading that respects in-flight requests
-   * const preloaded = await preloadAvatar('eve');
-   * if (avatarCache.trySet('eve', preloaded)) {
-   *   console.log('Cached preloaded avatar');
+   * // Force insert - always succeeds
+   * cache.set('key1', item1, 'force'); // Returns true
+   * cache.set('key1', item2);          // Returns true, 'force' is default
+   *
+   * // Replace only if already cached
+   * const wasReplaced = cache.set('key', newItem, 'replace');
+   * if (wasReplaced) {
+   *   console.log('Replaced existing cached item');
    * } else {
-   *   console.log('Avatar already cached or loading, discarding preload');
+   *   console.log('Key was not cached, nothing replaced');
    * }
-   * ```
    *
-   * @example
-   * ```typescript
-   * // Safe concurrent preloading
-   * const [result1, result2] = await Promise.all([
-   *   loadAvatar('user123'),
-   *   loadAvatar('user123')
-   * ]);
+   * // Try insert for speculative preloading (respects pending loads)
+   * if (cache.set('key', preloaded, 'try')) {
+   *   console.log('Successfully cached preloaded item');
+   * } else {
+   *   console.log('Slot occupied (cached or loading)');
+   * }
    *
-   * avatarCache.trySet('user123', result1); // First one succeeds
-   * avatarCache.trySet('user123', result2); // Second one fails, result2 discarded
+   * // Force cancels pending loads
+   * const pending = cache.get('key'); // Starts async load
+   * cache.set('key', immediate, 'force');
+   * await pending; // Resolves to immediate, not the network result
    * ```
    */
-  public trySet(id: Id, item: Item) {
-    const result = this.#trySet(id, item);
-    if (result) {
-      this.#onSet(id, item);
-    }
-    return result;
-  }
-
-  #trySet(id: Id, item: Item) {
+  public set(
+    id: Id,
+    item: Item,
+    mode: 'force' | 'replace' | 'try' = 'force',
+  ): boolean {
     if (
-      this.#cache.get(id)?.deref() !== undefined ||
-      this.#cacheLoading.has(id)
+      (mode === 'replace' &&
+        this.peek(id) === undefined &&
+        !this.#cacheLoading.has(id)) ||
+      (mode === 'try' &&
+        (this.peek(id) !== undefined || this.#cacheLoading.has(id)))
     ) {
       return false;
-    }
-    this.#cache.set(id, new WeakRef(item));
-    this.#cacheRegistry.register(item, id, item);
-    return true;
-  }
-
-  /**
-   * Forcefully replaces a cached value and cancels any pending load.
-   *
-   * Immediately overwrites any existing cached value and interrupts any in-flight load operation
-   * for this key. The interrupted load will still complete, but its result will be discarded and
-   * the new value will be used instead.
-   *
-   * **Use cases:** Manual cache invalidation, data refresh, hot reload, forced revalidation,
-   * or when external state changes require a new object instance immediately.
-   *
-   * **Load interruption:** Unlike {@link WeakCacheAsync.trySet | trySet()}, this method cancels
-   * pending loads. Any promises from {@link WeakCacheAsync.get | get()} that were waiting for
-   * the interrupted load will resolve to the force-set value instead.
-   *
-   * @param id - Cache key.
-   * @param item - New object to cache.
-   * @returns `void`
-   *
-   * @example
-   * ```typescript
-   * // Refresh after explicit update
-   * const updated = await fetchFreshAvatar('frank');
-   * avatarCache.forceSet('frank', updated);
-   * ```
-   *
-   * @example
-   * ```typescript
-   * // Interrupt slow load with cached data
-   * const slowLoad = avatarCache.get('user'); // Starts slow network request
-   *
-   * // User navigates away and back quickly, we have cached data now
-   * const cachedData = getCachedFromLocalStorage('user');
-   * avatarCache.forceSet('user', cachedData); // Interrupt network, use cache
-   *
-   * await slowLoad; // Resolves to cachedData, not the network result
-   * ```
-   */
-  public forceSet(id: Id, item: Item) {
-    const itemOld = this.#cache.get(id)?.deref();
-    if (itemOld !== undefined) {
-      this.#cacheRegistry.unregister(itemOld);
     }
     this.#cacheLoading.delete(id);
     this.#cache.set(id, new WeakRef(item));
     this.#cacheRegistry.register(item, id, item);
-    this.#onSet(id, item);
+    const watchers = this.#cacheWatchers.get(id);
+    if (watchers !== undefined) {
+      for (const watcher of watchers) {
+        watcher(item);
+      }
+    }
+    return true;
   }
 
   /**
@@ -453,7 +415,7 @@ export class WeakCacheAsync<
    *
    * The callback fires:
    * 1. **Immediately** when calling `watch()` (triggers async load if needed, calls callback when loaded)
-   * 2. **Every time a new instance appears** for this key (e.g., after GC + recreation, or after {@link WeakCacheAsync.forceSet | forceSet()})
+   * 2. **Every time a new instance appears** for this key (e.g., after GC + recreation, or after {@link WeakCacheAsync.set | set()})
    *
    * **Async behavior:** Unlike {@link WeakCache.watch | WeakCache.watch}, the initial callback
    * may not fire synchronously if a load is required. The callback receives the value once the
@@ -465,7 +427,7 @@ export class WeakCacheAsync<
    * is collected.
    *
    * **Caveat:** The callback may be called multiple times with different object instances for
-   * the same key if the value gets garbage collected and recreated, or if {@link WeakCacheAsync.forceSet | forceSet()}
+   * the same key if the value gets garbage collected and recreated, or if {@link WeakCacheAsync.set | set()}}
    * is called.
    *
    * @param id - Key to watch.
@@ -482,14 +444,13 @@ export class WeakCacheAsync<
    * @example
    * ```typescript
    * // React to initial load and subsequent updates
-   * avatarCache.watch('user123', async data => {
-   *   await processAvatar(data);
+   * avatarCache.watch('user123', data => {
    *   displayInUI(data);
    * });
    *
-   * // Later: force refresh triggers the callback again
+   * // Later: replace triggers the callback again
    * const fresh = await loadFreshAvatar('user123');
-   * avatarCache.forceSet('user123', fresh); // Callback fires with fresh data
+   * avatarCache.set('user123', fresh, 'force'); // Callback fires with fresh data
    * ```
    */
   public watch(id: Id, onSet: (item: Item) => void) {
@@ -531,6 +492,86 @@ export class WeakCacheAsync<
     if (set?.size === 0) this.#cacheWatchers.delete(id);
   }
 
+  #disposeHandlers: Set<(value: never) => void> | undefined;
+  #trigger(event: 'dispose', id: Id): void;
+  #trigger(event: string, value: never): void {
+    if (this.#disposeHandlers !== undefined) {
+      for (const callback of this.#disposeHandlers) {
+        callback(value);
+      }
+    }
+  }
+
+  /**
+   * Subscribes to garbage collection events for items in the cache.
+   *
+   * The callback fires when an item is automatically garbage collected by the JavaScript runtime.
+   * **Important:** This event is NOT fired for manual deletions via {@link WeakCacheAsync.del | del()}}
+   * or {@link WeakCacheAsync.clear | clear()}}.
+   *
+   * **Use cases:** Resource cleanup notifications, memory profiling, event logging, downstream cache
+   * invalidation, or handling external dependencies tied to cached items.
+   *
+   * @param event - Event identifier (`'dispose'`).
+   * @param callback - Function called with the ID of the garbage-collected item.
+   *
+   * @example
+   * ```typescript
+   * // Track automatic garbage collection
+   * cache.on('dispose', id => {
+   *   console.log(`Item ${id} was garbage collected`);
+   * });
+   * ```
+   *
+   * @example
+   * ```typescript
+   * // Clean up external resources when cached items are GC'd
+   * cache.on('dispose', id => {
+   *   releaseExternalResource(id);
+   *   database.closeConnection(id);
+   * });
+   * ```
+   *
+   * @example
+   * ```typescript
+   * // Distinguish between manual deletion and GC
+   * cache.on('dispose', id => {
+   *   console.log('Item was garbage collected (automatic):', id);
+   * });
+   *
+   * cache.del('key'); // No 'dispose' event fired
+   * // Later when GC runs and no strong refs exist, 'dispose' fires
+   * ```
+   */
+  public on(event: 'dispose', callback: (id: Id) => void): void;
+  public on(event: string, callback: (value: never) => void): void {
+    this.#disposeHandlers ??= new Set();
+    this.#disposeHandlers.add(callback);
+  }
+
+  /**
+   * Unsubscribes from garbage collection events.
+   *
+   * Removes a previously registered `'dispose'` event handler. You must pass the exact same
+   * callback reference that was used in {@link WeakCacheAsync.on | on('dispose')}}.
+   *
+   * @param event - Event identifier (`'dispose'`).
+   * @param callback - Exact callback function to remove.
+   *
+   * @example
+   * ```typescript
+   * const handleDispose = id => console.log(`${id} disposed`);
+   *
+   * cache.on('dispose', handleDispose);
+   * // ... later ...
+   * cache.off('dispose', handleDispose); // Stop listening
+   * ```
+   */
+  public off(event: 'dispose', callback: (id: Id) => void): void;
+  public off(event: string, callback: (value: never) => void): void {
+    this.#disposeHandlers?.delete(callback);
+  }
+
   /**
    * Removes all cached values, pending loads, and watchers.
    *
@@ -539,12 +580,15 @@ export class WeakCacheAsync<
    * remain valid and usable - this only affects the cache's internal bookkeeping.
    *
    * **Load cancellation:** Pending load promises will still resolve, but their results won't be cached.
-   * Any {@link WeakCacheAsync.get | get()} calls after `clear()` will start fresh loads.
+   * Any {@link WeakCacheAsync.get | get()}} calls after `clear()` will start fresh loads.
+   *
+   * **Event behavior:** Does not fire `'dispose'` events for cleared items (they're cleared explicitly,
+   * not garbage collected).
    *
    * **Use cases:** App reset, testing cleanup, explicit memory management, cache invalidation after
    * major state changes, or clearing state between user sessions.
    *
-   * **Effect:** Next {@link WeakCacheAsync.get | get()} for any key will start a new async load.
+   * **Effect:** Next {@link WeakCacheAsync.get | get()}} for any key will start a new async load.
    *
    * @example
    * ```typescript
@@ -564,13 +608,5 @@ export class WeakCacheAsync<
     this.#cache.clear();
     this.#cacheLoading.clear();
     this.#cacheWatchers.clear();
-  }
-
-  #onSet(id: Id, item: Item) {
-    const watchers = this.#cacheWatchers.get(id);
-    if (watchers === undefined) return;
-    for (const watcher of watchers) {
-      watcher(item);
-    }
   }
 }

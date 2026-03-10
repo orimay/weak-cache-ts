@@ -13,11 +13,12 @@
  * - Automatic cleanup when objects are garbage collected
  * - Multiple requests for the same key return the same object instance
  * - Manual eviction available via {@link WeakCache.del | del()} when needed
+ * - Event-based cleanup notifications via {@link WeakCache.on | on('dispose')}
  *
  * **Memory characteristics:** The cache itself uses minimal memory (only weak references and keys).
  * Objects stay alive only as long as your code holds strong references to them.
  *
- * @template Item - Type of cached objects (must be an object, not a primitive).
+ * @template Item - Type of cached objects (must be a WeakKey).
  * @template Id - Type of cache keys (string or symbol by default).
  *
  * @example
@@ -47,18 +48,19 @@
  * @see {@link WeakCacheAsync} for asynchronous loading with network requests or async I/O.
  */
 export class WeakCache<
-  Item extends object,
+  Item extends WeakKey,
   Id extends string | symbol = string | symbol,
 > {
   /**
-   * Removes an entry from the cache immediately.
+   * Removes an entry from the cache immediately and unregisters it from garbage collection tracking.
    *
    * Use this when you know an object is no longer needed and want to free its cache slot
    * immediately rather than waiting for garbage collection (e.g., user logged out, document
    * closed, or resource explicitly invalidated).
    *
-   * **Effect:** The key is removed and the next {@link WeakCache.get | get()} will reload.
-   * This does not affect existing strong references - those objects remain usable.
+   * **Effect:** The key is removed, watchers are cleaned up, and the next {@link WeakCache.get | get()}
+   * will reload. This does not affect existing strong references - those objects remain usable.
+   * The `'dispose'` event is **NOT** triggered for manual deletions.
    *
    * @param id - The key to remove from the cache.
    *
@@ -68,13 +70,20 @@ export class WeakCache<
    * ```
    */
   public readonly del = (id: Id) => {
+    const item = this.peek(id);
+    item !== undefined && this.#cacheRegistry.unregister(item);
     this.#cache.delete(id);
     this.#cacheWatchers.delete(id);
   };
 
   #loader: (id: Id) => Item;
   #cache = new Map<Id, WeakRef<Item>>();
-  #cacheRegistry = new FinalizationRegistry<Id>(this.del);
+  #cacheRegistry = new FinalizationRegistry<Id>(id => {
+    this.#cache.delete(id);
+    this.#cacheWatchers.delete(id);
+    this.#trigger('dispose', id);
+  });
+
   #cacheWatchers = new Map<Id, Set<(item: Item) => void>>();
 
   /**
@@ -147,7 +156,7 @@ export class WeakCache<
    * }
    * ```
    */
-  public* entries(): Iterable<[Id, Item]> {
+  public *entries(): Iterable<[Id, Item]> {
     for (const [key, value] of this.#cache) {
       const item = value.deref();
       if (item !== undefined) {
@@ -181,7 +190,7 @@ export class WeakCache<
   }
 
   /**
-   * Retrieves a cached value or creates it on demand.
+   * Retrieves a cached value or creates it on demand. **Bound method** - safe for Array.map() and callbacks.
    *
    * Returns the same object instance for repeated calls with the same key (perfect deduplication).
    * If the value was garbage collected, it's transparently recreated using the loader.
@@ -192,7 +201,7 @@ export class WeakCache<
    * - `init`: Optional callback for post-creation setup (e.g., attach event listeners, configure object)
    *
    * **Behavior:** Always returns immediately (synchronous). The object is kept alive as long as
-   * your code holds a reference to it.
+   * your code holds a reference to it. Calls watchers if this is the first time loading.
    *
    * @param id - Cache key to retrieve or create.
    * @param create - Optional override factory for this specific call.
@@ -217,30 +226,35 @@ export class WeakCache<
    *   }
    * );
    * ```
+   *
+   * @example
+   * ```typescript
+   * // Array.map() usage - bound method works perfectly
+   * const ids = ['user-1', 'user-2', 'user-3'];
+   * const users = ids.map(userCache.get);
+   * ```
    */
   public readonly get = (
     id: Id,
     create?: () => Item,
     init?: (item: Item) => void,
   ) => {
-    let item = this.#cache.get(id)?.deref();
+    let item = this.peek(id);
     if (item !== undefined) return item;
     item = create?.() ?? this.#loader(id);
     init?.(item);
-    this.#cache.set(id, new WeakRef(item));
-    this.#cacheRegistry.register(item, id, item);
-    this.#onSet(id, item);
+    this.set(id, item);
     return item;
   };
 
   /**
-   * Inspects the cache without triggering a load.
+   * Inspects the cache without triggering a load. **Bound method** - safe for callbacks.
    *
    * Returns the cached value if it exists and is still alive, or `undefined` if the key
    * is missing or its value was garbage collected. Never calls the loader.
    *
-   * **Use cases:** Checking if work can be avoided, conditional rendering, or testing
-   * cache state without side effects.
+   * **Use cases:** Checking if work can be avoided, conditional rendering without triggering loads,
+   * or testing cache state without side effects.
    *
    * @param id - Key to inspect.
    * @returns The live value or `undefined` if not present/collected.
@@ -249,7 +263,7 @@ export class WeakCache<
    * ```typescript
    * const img = avatarCache.peek('dave');
    * if (img) {
-   *   // Already cached, draw immediately
+   *   // Already cached, use immediately
    *   canvas.drawImage(img, 0, 0);
    * } else {
    *   // Not cached, show placeholder
@@ -262,82 +276,105 @@ export class WeakCache<
   };
 
   /**
-   * Inserts a pre-created value into the cache if the key is available.
-   *
-   * Succeeds only if the key has no live cached value. Does nothing if the key already
-   * exists with a live value. This is useful for speculative caching or when multiple
-   * code paths might create the same object independently.
-   *
-   * **Pattern:** Create object optimistically, then try to cache it. If someone else
-   * cached it first, your object is simply discarded.
+   * Inserts, replaces, or conditionally sets a cached value.
    *
    * @param id - Cache key.
-   * @param item - Pre-created object to cache.
-   * @returns `true` if inserted, `false` if key already had a live value.
+   * @param item - Object to cache.
+   * @param mode - Insertion mode:
+   *   - `'force'` (default): Always insert, unconditionally overwriting any existing value
+   *   - `'replace'`: Only insert if a value is already cached, returns `false` otherwise
+   *   - `'try'`: Only insert if the key is completely empty, returns `false` if already cached
+   * @returns `true` if insertion succeeded, `false` if blocked by mode constraints.
+   *
+   * **Behavior:** Registers the item for automatic garbage collection tracking. Unregisters the old
+   * value's GC tracking when replaced. Fires registered watchers only if insertion succeeds.
+   *
+   * **Mode semantics:**
+   * - `'force'`: Unconditional replacement. Use for cache invalidation, manual refresh, or forced updates.
+   * - `'replace'`: Safe update for already-cached items. Ideal for refresh scenarios where you want to
+   *   fail silently if nothing was cached yet.
+   * - `'try'`: Safe speculative insertion. Perfect for preloading patterns—insert if free, otherwise discard.
    *
    * @example
    * ```typescript
-   * // Speculative preloading
-   * const preloaded = decodeImage(data);
-   * if (avatarCache.trySet('dave', preloaded)) {
-   *   console.log('Cached preloaded avatar');
+   * // Force insert - always overwrites
+   * cache.set('key', item1, 'force'); // Returns true
+   * cache.set('key', item2);          // Returns true, 'force' is default
+   * ```
+   *
+   * @example
+   * ```typescript
+   * // Replace only if already cached - manual refresh pattern
+   * const refreshed = expensiveComputation('key');
+   * if (cache.set('key', refreshed, 'replace')) {
+   *   console.log('Cache updated');
    * } else {
-   *   console.log('Avatar already cached, discarding preload');
+   *   console.log('Key was not cached, refresh ignored');
    * }
    * ```
-   */
-  public trySet(id: Id, item: Item) {
-    if (this.#cache.get(id)?.deref() !== undefined) return false;
-    this.#cache.set(id, new WeakRef(item));
-    this.#cacheRegistry.register(item, id, item);
-    this.#onSet(id, item);
-    return true;
-  }
-
-  /**
-   * Forcefully replaces a cached value (invalidation/refresh).
-   *
-   * Immediately overwrites any existing cached value with the new one, regardless of
-   * whether the key exists. Cleans up the old value's weak reference properly.
-   *
-   * **Use cases:** Manual cache invalidation, data refresh, hot reload, or when external
-   * state changes require a new object instance.
-   *
-   * @param id - Cache key.
-   * @param item - New object to cache.
-   * @returns `true` if an existing value was replaced, `false` if key was empty.
    *
    * @example
    * ```typescript
-   * // Refresh after update
-   * const updated = await fetchAndDecodeAvatar('frank');
-   * avatarCache.forceSet('frank', updated);
+   * // Try insert - speculative preloading pattern
+   * const preloaded = expensiveComputation();
+   * if (cache.set('key', preloaded, 'try')) {
+   *   console.log('Preload successful');
+   * } else {
+   *   console.log('Already cached, preload discarded');
+   * }
+   * ```
+   *
+   * @example
+   * ```typescript
+   * // All modes trigger watchers when successful
+   * cache.watch('key', item => {
+   *   console.log('Watcher fired with:', item);
+   * });
+   *
+   * cache.set('key', new Item(), 'force');   // Watcher fires
+   * cache.set('key', another(), 'replace');  // Watcher fires (if key was cached)
+   * cache.set('key', other(), 'try');        // Watcher fires (if key was empty)
    * ```
    */
-  public forceSet(id: Id, item: Item) {
-    const itemOld = this.#cache.get(id)?.deref();
-    if (itemOld !== undefined) {
-      this.#cacheRegistry.unregister(itemOld);
+  public set(
+    id: Id,
+    item: Item,
+    mode: 'force' | 'replace' | 'try' = 'force',
+  ): boolean {
+    if (
+      (mode === 'replace' && this.peek(id) === undefined) ||
+      (mode === 'try' && this.peek(id) !== undefined)
+    ) {
+      return false;
     }
     this.#cache.set(id, new WeakRef(item));
     this.#cacheRegistry.register(item, id, item);
-    this.#onSet(id, item);
-    return itemOld !== undefined;
+    const watchers = this.#cacheWatchers.get(id);
+    if (watchers !== undefined) {
+      for (const watcher of watchers) {
+        watcher(item);
+      }
+    }
+    return true;
   }
 
   /**
    * Subscribes to value changes for a specific key.
    *
    * The callback fires:
-   * 1. **Immediately** when calling `watch()` (triggers load if needed, calls callback with result)
-   * 2. **Every time a new instance appears** for this key (e.g., after GC + recreation, or after {@link WeakCache.forceSet | forceSet()})
+   * 1. **Immediately** when calling `watch()` (loads the value if needed, then calls callback)
+   * 2. **Every time a new instance appears** for this key (e.g., after GC + recreation, or after {@link WeakCache.set | set()})
+   *
+   * **Synchronous behavior:** The callback fires synchronously during the call to `watch()`.
+   * The value must already exist or will be created immediately by the loader.
    *
    * **Memory safety:** Watchers are automatically cleaned up when the value is garbage collected
    * or explicitly deleted. You don't need to call {@link WeakCache.unwatch | unwatch()} to prevent
    * leaks, but you should call it if you want to stop receiving updates before the value is collected.
    *
    * **Caveat:** The callback may be called multiple times with different object instances for
-   * the same key if the value gets garbage collected and recreated.
+   * the same key if the value gets garbage collected and recreated, or if {@link WeakCache.set | set()}}
+   * is called with `'force'` mode.
    *
    * @param id - Key to watch.
    * @param onSet - Callback receiving the current or new value.
@@ -374,7 +411,7 @@ export class WeakCache<
    *
    * Use this when you no longer want to receive updates for a key. If not called, the watcher
    * will automatically stop when the value is garbage collected or deleted, so this is primarily
-   * for unsubscribing before that happens.
+   * for unsubscribing before that happens (e.g., component unmount, navigation away).
    *
    * **Note:** You must pass the exact same callback function reference that was used in `watch()`.
    *
@@ -396,12 +433,95 @@ export class WeakCache<
     if (set?.size === 0) this.#cacheWatchers.delete(id);
   }
 
+  #disposeHandlers: Set<(value: never) => void> | undefined;
+  #trigger(event: 'dispose', id: Id): void;
+  #trigger(event: string, value: never): void {
+    if (this.#disposeHandlers !== undefined) {
+      for (const callback of this.#disposeHandlers) {
+        callback(value);
+      }
+    }
+  }
+
+  /**
+   * Subscribes to garbage collection events for items in the cache.
+   *
+   * The callback fires when an item is automatically garbage collected by the JavaScript runtime.
+   * **Important:** This event is **NOT** fired for manual deletions via {@link WeakCache.del | del()}}
+   * or {@link WeakCache.clear | clear()}}.
+   *
+   * **Use cases:** Resource cleanup notifications, memory profiling, event logging, downstream cache
+   * invalidation, or handling external dependencies tied to cached items.
+   *
+   * @param event - Event identifier (`'dispose'`).
+   * @param callback - Function called with the ID of the garbage-collected item.
+   *
+   * @example
+   * ```typescript
+   * // Track automatic garbage collection
+   * cache.on('dispose', id => {
+   *   console.log(`Item ${id} was garbage collected`);
+   * });
+   * ```
+   *
+   * @example
+   * ```typescript
+   * // Clean up external resources when cached items are GC'd
+   * cache.on('dispose', id => {
+   *   releaseExternalResource(id);
+   *   database.closeConnection(id);
+   * });
+   * ```
+   *
+   * @example
+   * ```typescript
+   * // Distinguish between manual deletion and GC
+   * cache.on('dispose', id => {
+   *   console.log('Item was garbage collected (automatic):', id);
+   * });
+   *
+   * cache.del('key'); // No 'dispose' event fired
+   * // Later when GC runs and no strong refs exist, 'dispose' fires
+   * ```
+   */
+  public on(event: 'dispose', callback: (id: Id) => void): void;
+  public on(event: string, callback: (value: never) => void): void {
+    this.#disposeHandlers ??= new Set();
+    this.#disposeHandlers.add(callback);
+  }
+
+  /**
+   * Unsubscribes from garbage collection events.
+   *
+   * Removes a previously registered `'dispose'` event handler. You must pass the exact same
+   * callback reference that was used in {@link WeakCache.on | on('dispose')}}.
+   *
+   * @param event - Event identifier (`'dispose'`).
+   * @param callback - Exact callback function to remove.
+   *
+   * @example
+   * ```typescript
+   * const handleDispose = id => console.log(`${id} disposed`);
+   *
+   * cache.on('dispose', handleDispose);
+   * // ... later ...
+   * cache.off('dispose', handleDispose); // Stop listening
+   * ```
+   */
+  public off(event: 'dispose', callback: (id: Id) => void): void;
+  public off(event: string, callback: (value: never) => void): void {
+    this.#disposeHandlers?.delete(callback);
+  }
+
   /**
    * Removes all cached values and watchers.
    *
    * Clears all weak references and watchers, resetting the cache to its initial empty state.
    * Existing strong references in your code remain valid and usable - this only affects
    * the cache's internal bookkeeping.
+   *
+   * **Event behavior:** Does not fire `'dispose'` events for cleared items (they're cleared explicitly,
+   * not garbage collected).
    *
    * **Use cases:** App reset, testing cleanup, explicit memory management, or cache invalidation
    * after major state changes.
@@ -413,17 +533,17 @@ export class WeakCache<
    * // Reset cache on app reload
    * avatarCache.clear();
    * ```
+   *
+   * @example
+   * ```typescript
+   * // Testing cleanup
+   * afterEach(() => {
+   *   avatarCache.clear(); // Fresh state for each test
+   * });
+   * ```
    */
   public clear(): void {
     this.#cache.clear();
     this.#cacheWatchers.clear();
-  }
-
-  #onSet(id: Id, item: Item) {
-    const watchers = this.#cacheWatchers.get(id);
-    if (watchers === undefined) return;
-    for (const watcher of watchers) {
-      watcher(item);
-    }
   }
 }
