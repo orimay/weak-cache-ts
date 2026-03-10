@@ -25,16 +25,9 @@ export function mockGC() {
   }
 
   function gc(minor?: boolean): void;
-  function gc(
-    options: NodeJS.GCOptions & { execution: 'async' },
-  ): Promise<void>;
+  function gc(options: NodeJS.GCOptions & { execution: 'async' }): Promise<void>;
   function gc(options: NodeJS.GCOptions): void;
-  function gc(
-    options?:
-      | boolean
-      | NodeJS.GCOptions
-      | (NodeJS.GCOptions & { execution: 'async' }),
-  ) {
+  function gc(options?: boolean | NodeJS.GCOptions | (NodeJS.GCOptions & { execution: 'async' })) {
     if (typeof options === 'object' && options.execution === 'async') {
       return Promise.resolve().then(cleanup);
     } else {
