@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, type Mock, vi } from 'vitest';
 import { WeakCache } from '.';
 
 describe('WeakCache', () => {
-  let cache: WeakCache<{ value: string; }, string>;
+  let cache: WeakCache<{ value: string }, string>;
   let loader: Mock<
     (id: string) => {
       value: string;
@@ -73,7 +73,7 @@ describe('WeakCache', () => {
     });
 
     it('calls init after creation', () => {
-      const init = vi.fn((item: { value: string; }) => {
+      const init = vi.fn((item: { value: string }) => {
         item.value += ' init';
       });
       const item = cache.get('key', undefined, init);
@@ -139,7 +139,7 @@ describe('WeakCache', () => {
 
   describe('watch', () => {
     it('executes callback immediately on get', () => {
-      const watcher = vi.fn<(item: { value: string; }) => void>();
+      const watcher = vi.fn<(item: { value: string }) => void>();
       cache.watch('key', watcher);
 
       expect(watcher).toHaveBeenCalledTimes(1);
@@ -147,7 +147,7 @@ describe('WeakCache', () => {
     });
 
     it('executes callback on set', () => {
-      const watcher = vi.fn<(item: { value: string; }) => void>();
+      const watcher = vi.fn<(item: { value: string }) => void>();
       cache.watch('key', watcher);
 
       cache.forceSet('key', { value: 'value' });
@@ -157,7 +157,7 @@ describe('WeakCache', () => {
     });
 
     it("doesn't execute callback after del", () => {
-      const watcher = vi.fn<(item: { value: string; }) => void>();
+      const watcher = vi.fn<(item: { value: string }) => void>();
       cache.watch('key', watcher);
 
       cache.del('key');
@@ -169,7 +169,7 @@ describe('WeakCache', () => {
 
   describe('unwatch', () => {
     it('stops callback call', () => {
-      const watcher = vi.fn<(item: { value: string; }) => void>();
+      const watcher = vi.fn<(item: { value: string }) => void>();
       cache.watch('key', watcher);
 
       cache.unwatch('key', watcher);

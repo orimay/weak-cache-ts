@@ -46,10 +46,7 @@
  *
  * @see {@link WeakCacheAsync} for asynchronous loading with network requests or async I/O.
  */
-export class WeakCache<
-  Item extends object,
-  Id extends string | symbol = string | symbol,
-> {
+export class WeakCache<Item extends object, Id extends string | symbol = string | symbol> {
   /**
    * Removes an entry from the cache immediately.
    *
@@ -147,7 +144,7 @@ export class WeakCache<
    * }
    * ```
    */
-  public* entries(): Iterable<[Id, Item]> {
+  public *entries(): Iterable<[Id, Item]> {
     for (const [key, value] of this.#cache) {
       const item = value.deref();
       if (item !== undefined) {
@@ -218,11 +215,7 @@ export class WeakCache<
    * );
    * ```
    */
-  public readonly get = (
-    id: Id,
-    create?: () => Item,
-    init?: (item: Item) => void,
-  ) => {
+  public readonly get = (id: Id, create?: () => Item, init?: (item: Item) => void) => {
     let item = this.#cache.get(id)?.deref();
     if (item !== undefined) return item;
     item = create?.() ?? this.#loader(id);

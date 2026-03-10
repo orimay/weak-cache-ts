@@ -51,10 +51,7 @@
  *
  * @see {@link WeakCache} for synchronous loading without network/async I/O.
  */
-export class WeakCacheAsync<
-  Item extends object,
-  Id extends string | symbol = string | symbol,
-> {
+export class WeakCacheAsync<Item extends object, Id extends string | symbol = string | symbol> {
   /**
    * Removes an entry and cancels any pending load.
    *
@@ -164,7 +161,7 @@ export class WeakCacheAsync<
    * }
    * ```
    */
-  public* entries(): Iterable<[Id, Item]> {
+  public *entries(): Iterable<[Id, Item]> {
     for (const [key, value] of this.#cache) {
       const item = value.deref();
       if (item !== undefined) {
@@ -269,9 +266,7 @@ export class WeakCacheAsync<
       // Store the pending promise so other callers wait for it
       this.#cacheLoading.set(id, new WeakRef(loadPromise));
 
-      const item = await loadPromise.finally(() =>
-        this.#cacheLoading.delete(id),
-      );
+      const item = await loadPromise.finally(() => this.#cacheLoading.delete(id));
       await init?.(item);
 
       // making sure to return the item either loaded now or set in parallel
@@ -389,10 +384,7 @@ export class WeakCacheAsync<
   }
 
   #trySet(id: Id, item: Item) {
-    if (
-      this.#cache.get(id)?.deref() !== undefined ||
-      this.#cacheLoading.has(id)
-    ) {
+    if (this.#cache.get(id)?.deref() !== undefined || this.#cacheLoading.has(id)) {
       return false;
     }
     this.#cache.set(id, new WeakRef(item));
